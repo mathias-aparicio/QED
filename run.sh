@@ -2,7 +2,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="$(conda run -n agent which python)"
+# Run Python through uv: it auto-creates/syncs a project venv from pyproject.toml.
+PY=(uv run --project "$SCRIPT_DIR" python)
+
+# Load the project's opencode config (registers the web-search plugin) unless
+# the user already set one. The plugin auto-installs on the first opencode run.
+export OPENCODE_CONFIG="${OPENCODE_CONFIG:-$SCRIPT_DIR/opencode.json}"
 
 PROBLEM_FILE="${1:-$SCRIPT_DIR/problem/problem.tex}"
 OUTPUT_DIR="${2:-$SCRIPT_DIR/proof_output}"
@@ -11,7 +16,7 @@ CONFIG="${3:-$SCRIPT_DIR/config.yaml}"
 echo "============================================================"
 echo "  Running smoke tests..."
 echo "============================================================"
-"$PYTHON" "$SCRIPT_DIR/code/smoke_test.py" --config "$CONFIG"
+"${PY[@]}" "$SCRIPT_DIR/code/smoke_test.py" --config "$CONFIG"
 echo ""
 
 # Copy global human_help into the output directory so the pipeline reads
@@ -30,7 +35,7 @@ echo "  Output:   $OUTPUT_DIR"
 echo "  Config:   $CONFIG"
 echo ""
 
-exec "$PYTHON" "$SCRIPT_DIR/code/pipeline.py" \
+exec "${PY[@]}" "$SCRIPT_DIR/code/pipeline.py" \
     --input "$PROBLEM_FILE" \
     --output "$OUTPUT_DIR" \
     --config "$CONFIG"

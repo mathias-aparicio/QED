@@ -1,0 +1,17 @@
+[project]
+name = "qed"
+version = "0.1.0"
+description = "QED — multi-LLM natural-language proof search and verification pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+ui = [
+    "streamlit",
+    "streamlit-autorefresh",
+]
+
+[tool.uv]
+package = false

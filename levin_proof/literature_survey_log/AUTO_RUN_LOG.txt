@@ -1,0 +1,9 @@
+[Auxiliary] Running Literature Survey with role config={'provider': 'opencode', 'model': 'google/gemini-3-flash-preview'}
+[OpenCode] Starting Literature Survey (model=google/gemini-3-flash-preview)
+[Auxiliary] Running Literature Survey with role config={'provider': 'opencode', 'model': 'google/gemini-3.5-flash'}
+[OpenCode] Starting Literature Survey (model=google/gemini-3.5-flash)
+[Auxiliary] Running Literature Survey with role config={'provider': 'opencode', 'model': 'google/gemini-3.5-flash'}
+[OpenCode] Starting Literature Survey (model=google/gemini-3.5-flash)
+[OpenCode] provider error: AI_RetryError
+[OpenCode] Attempt 1/3 failed: [opencode] json_parse_error: Failed to parse opencode export JSON: Expecting property name enclosed in double quotes: line 491 column 7 (char 65468)
+[OpenCode] Retrying in 5s...

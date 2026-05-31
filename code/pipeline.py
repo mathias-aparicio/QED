@@ -78,9 +78,14 @@ def make_claude_options(claude_cfg: dict, working_dir: str) -> dict:
 
 
 def check_prerequisites():
-    """Check that required tools are available."""
+    """Check that required tools are available.
+
+    The model backend (opencode) is validated config-aware in smoke_test.py
+    (which run.sh runs first, using the configured cli_path), so here we only
+    require the Python runtime.
+    """
     missing = []
-    for cmd in ["claude", "python3"]:
+    for cmd in ["python3"]:
         if shutil.which(cmd) is None:
             missing.append(cmd)
     if missing:
@@ -712,7 +717,10 @@ async def main():
     shutil.copy2(args.config, os.path.join(output_dir, "config_used.yaml"))
 
     claude_opts = make_claude_options(claude_cfg, output_dir)
-    tracker = TokenTracker(output_dir, claude_opts["model"])
+    # Label the token report with the actual backend. The project runs on
+    # opencode; fall back to the claude model name only if opencode is absent.
+    primary_model = config.get("opencode", {}).get("model") or claude_opts["model"]
+    tracker = TokenTracker(output_dir, primary_model)
 
     skip_survey = literature_survey_complete(output_dir)
 

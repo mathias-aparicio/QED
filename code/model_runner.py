@@ -12,9 +12,46 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
+
+
+async def _progress_heartbeat(label: str, start: datetime, stop: "asyncio.Event") -> None:
+    """Show a live elapsed-time spinner while a model call runs.
+
+    Answers "am I stuck or making progress?": the timer keeps climbing while
+    the call is alive. Animates on a TTY (single line rewritten via ``\\r``);
+    when output is piped/redirected (e.g. the UI) it emits a heartbeat line
+    every ~30s instead, so liveness is still visible in logs.
+    """
+    frames = "|/-\\"
+    tty = False
+    try:
+        tty = sys.stderr.isatty()
+    except Exception:
+        tty = False
+    i = 0
+    last_log = 0.0
+    while not stop.is_set():
+        elapsed = (datetime.now() - start).total_seconds()
+        mm, ss = int(elapsed // 60), int(elapsed % 60)
+        if tty:
+            sys.stderr.write(f"\r  {frames[i % len(frames)]} {label} — running {mm}:{ss:02d} ...    ")
+            sys.stderr.flush()
+        elif elapsed - last_log >= 30:
+            sys.stderr.write(f"  ... {label} still running ({mm}:{ss:02d})\n")
+            sys.stderr.flush()
+            last_log = elapsed
+        i += 1
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.4)
+        except asyncio.TimeoutError:
+            pass
+    if tty:
+        sys.stderr.write("\r" + " " * 72 + "\r")
+        sys.stderr.flush()
 
 
 class ModelRunnerError(Exception):
@@ -588,6 +625,346 @@ async def run_gemini_agent(
 
 
 # ---------------------------------------------------------------------------
+# OpenCode wrapper
+# ---------------------------------------------------------------------------
+
+def _extract_opencode_session_id(stdout: str, stderr: str) -> str | None:
+    """Pull the opencode session id out of a ``run`` invocation's output.
+
+    ``opencode run --format json`` reliably flushes a ``step_start`` event to
+    stdout, and that event carries ``sessionID`` (both top-level and on its
+    ``part``). We fall back to scanning stderr for a ``ses_...`` token in case
+    the JSON envelope changes across versions.
+    """
+    import re
+
+    for line in (stdout or "").strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(ev, dict):
+            sid = ev.get("sessionID")
+            if sid:
+                return sid
+            part = ev.get("part")
+            if isinstance(part, dict) and part.get("sessionID"):
+                return part["sessionID"]
+
+    m = re.search(r"ses_[A-Za-z0-9]+", stderr or "")
+    return m.group(0) if m else None
+
+
+def _parse_opencode_export(export_stdout: str) -> tuple[str, int, int]:
+    """Parse ``opencode export`` JSON into (response_text, in_tokens, out_tokens).
+
+    Export shape: ``{"info": {...}, "messages": [{"info": {role, tokens}, "parts":
+    [{"type": "text", "text": ...}, ...]}, ...]}``. The response is the text of
+    the *last* assistant message; token usage is summed across all assistant
+    messages (reasoning tokens fold into output, matching the Gemini runner).
+    Never raises: opencode can emit malformed/partial JSON for a session that
+    ended on a provider error, so on a parse failure we fall back to a
+    best-effort text salvage and let the caller surface the real provider error.
+    """
+    if not export_stdout.strip():
+        return "", 0, 0
+    try:
+        data = json.loads(export_stdout)
+    except (json.JSONDecodeError, ValueError):
+        return _salvage_opencode_text(export_stdout), 0, 0
+
+    messages = data.get("messages", []) if isinstance(data, dict) else []
+
+    input_tokens = 0
+    output_tokens = 0
+    last_text: list[str] = []
+
+    for msg in messages:
+        info = msg.get("info", {}) if isinstance(msg, dict) else {}
+        if info.get("role") != "assistant":
+            continue
+        toks = info.get("tokens") or {}
+        input_tokens += int(toks.get("input", 0) or 0)
+        output_tokens += int(toks.get("output", 0) or 0)
+        output_tokens += int(toks.get("reasoning", 0) or 0)
+
+        texts = [
+            p.get("text", "")
+            for p in msg.get("parts", [])
+            if isinstance(p, dict) and p.get("type") == "text"
+            and isinstance(p.get("text"), str)
+        ]
+        if texts:
+            last_text = texts  # keep only the final assistant turn's text
+
+    return "".join(last_text).strip(), input_tokens, output_tokens
+
+
+def _salvage_opencode_text(export_stdout: str) -> str:
+    """Best-effort recovery of the last assistant text from a malformed export.
+
+    Scans for ``"type":"text"`` parts and decodes the following ``"text": "…"``
+    JSON string literal (which handles escaping correctly). Returns the last one
+    found, or "" if none — in which case the caller treats it as no response.
+    """
+    import re
+
+    dec = json.JSONDecoder()
+    texts: list[str] = []
+    for m in re.finditer(r'"type"\s*:\s*"text"', export_stdout):
+        seg = export_stdout[m.end():]
+        tm = re.search(r'"text"\s*:\s*(")', seg)
+        if not tm:
+            continue
+        try:
+            val, _ = dec.raw_decode(seg[tm.start(1):])  # decode the string literal
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(val, str) and val.strip():
+            texts.append(val)
+    return texts[-1].strip() if texts else ""
+
+
+def _extract_opencode_error(stderr: str) -> tuple[str | None, bool]:
+    """Pull a concise error out of opencode's ``--print-logs`` stderr.
+
+    Returns ``(message, is_auth_error)``. ``is_auth_error`` is True for a
+    missing/unusable API key — those are not worth retrying, so the caller can
+    fail fast with actionable guidance instead of silently backing off.
+    """
+    if not stderr:
+        return None, False
+    low = stderr.lower()
+    if "ai_loadapikeyerror" in low or ("api key" in low and "missing" in low):
+        return ("Google API key is missing/unavailable to the non-interactive "
+                "opencode subprocess. Run `opencode auth login` (choose Google) so "
+                "the key persists for subprocess use, then retry."), True
+
+    # Parse the first `error={...}` JSON object (e.g. AI_APICallError) for a
+    # status code + provider message.
+    dec = json.JSONDecoder()
+    idx = stderr.find("error=")
+    while idx != -1:
+        frag = stderr[idx + len("error="):].lstrip()
+        try:
+            obj, _ = dec.raw_decode(frag)
+        except (json.JSONDecodeError, ValueError):
+            obj = None
+        if isinstance(obj, dict):
+            e = obj.get("error", obj)
+            name = e.get("name", "error")
+            status = e.get("statusCode")
+            rb = e.get("responseBody") or e.get("data") or {}
+            if isinstance(rb, str):
+                try:
+                    rb = json.loads(rb)
+                except (json.JSONDecodeError, ValueError):
+                    rb = {}
+            msg = ""
+            if isinstance(rb, dict) and isinstance(rb.get("error"), dict):
+                msg = rb["error"].get("message", "")
+            return f"{name}" + (f" (HTTP {status})" if status else "") + (f": {msg}" if msg else ""), False
+        idx = stderr.find("error=", idx + 6)
+    return None, False
+
+
+async def run_opencode_agent(
+    prompt: str,
+    working_dir: str,
+    opencode_config: dict,
+    logger=None,
+    tracker=None,
+    call_name: str = "",
+) -> str:
+    """Run the opencode CLI as a proof-search agent. Returns response text.
+
+    opencode is driven non-interactively via ``opencode run``. Unlike the other
+    CLIs it does not flush the assistant reply to stdout when stdout is a pipe
+    (only the ``step_start`` event escapes), and it exits 0 even when the model
+    call fails (e.g. an HTTP 503 from the provider). So we run, recover the
+    ``sessionID`` from the run output, then read the assistant text and token
+    usage back via ``opencode export <session>``. An empty reply is treated as
+    a retryable error.
+
+    Args:
+        prompt: The full prompt string to send.
+        working_dir: Directory the agent operates in (``--dir`` and cwd).
+        opencode_config: Dict with keys: cli_path, model (``provider/model``,
+            e.g. ``google/gemini-3.5-flash``), variant, agent, api_key, timeout.
+        logger: Optional PipelineLogger.
+        tracker: Optional TokenTracker.
+        call_name: Human-readable label for this call.
+    """
+    cli_path = opencode_config.get("cli_path", "opencode")
+    model = opencode_config.get("model", "google/gemini-3-flash-preview")
+    variant = opencode_config.get("variant", "")
+    agent_name = opencode_config.get("agent", "")
+    api_key = opencode_config.get("api_key", "")
+    timeout = opencode_config.get("timeout", 1800)
+
+    run_cmd = [
+        cli_path, "run",
+        "--format", "json",
+        "--print-logs", "--log-level", "ERROR",  # surface provider/auth errors on stderr
+        "--dangerously-skip-permissions",
+        "-m", model,
+        "--dir", working_dir,
+    ]
+    if variant:
+        run_cmd += ["--variant", variant]
+    if agent_name:
+        run_cmd += ["--agent", agent_name]
+    run_cmd.append(prompt)
+
+    def _env():
+        env = os.environ.copy()
+        if api_key:
+            # opencode's google provider reads the key from GEMINI_API_KEY.
+            env["GEMINI_API_KEY"] = api_key
+        # Default to the project's opencode config (registers the web-search
+        # plugin) when the caller hasn't set one and the file is present.
+        if "OPENCODE_CONFIG" not in env:
+            repo_cfg = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "opencode.json",
+            )
+            if os.path.exists(repo_cfg):
+                env["OPENCODE_CONFIG"] = repo_cfg
+        return env
+
+    def _run(cmd, to):
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,  # opencode run blocks on stdin EOF otherwise
+            text=True,
+            cwd=working_dir,
+            env=_env(),
+            timeout=to,
+        )
+
+    MAX_RETRIES = 3
+    RETRY_BACKOFF = [5, 15, 30]  # seconds; provider 503s are common and transient
+
+    start = datetime.now()
+    if logger:
+        logger.log(f"[OpenCode] Starting {call_name} (model={model})")
+
+    last_error = None
+    response = ""
+    input_tokens = 0
+    output_tokens = 0
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        result = None
+        attempt_label = (call_name or "opencode") + (f" (retry {attempt})" if attempt > 1 else "")
+        stop_hb = asyncio.Event()
+        heartbeat = asyncio.ensure_future(
+            _progress_heartbeat(attempt_label, datetime.now(), stop_hb)
+        )
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _run, run_cmd, timeout
+            )
+        except subprocess.TimeoutExpired:
+            last_error = ModelRunnerError(
+                provider="opencode", error_type="subprocess_error",
+                message=f"opencode CLI timed out after {timeout}s",
+            )
+        except Exception as exc:
+            last_error = ModelRunnerError(
+                provider="opencode", error_type="subprocess_error",
+                message=f"Failed to execute opencode CLI: {type(exc).__name__}: {exc}",
+            )
+        finally:
+            stop_hb.set()
+            await heartbeat
+
+        fatal = False
+        if result is not None:
+            oc_err, oc_auth = _extract_opencode_error(result.stderr)
+            if oc_err and logger:
+                logger.log(f"[OpenCode] provider error: {oc_err}")
+
+            session_id = _extract_opencode_session_id(result.stdout, result.stderr)
+            if not session_id:
+                last_error = ModelRunnerError(
+                    provider="opencode", error_type="json_parse_error",
+                    message="Could not determine opencode session id from run output"
+                            + (f" — {oc_err}" if oc_err else ""),
+                    exit_code=result.returncode, stderr=result.stderr, stdout=result.stdout,
+                )
+                fatal = oc_auth
+            else:
+                try:
+                    exp = await asyncio.get_event_loop().run_in_executor(
+                        None, _run, [cli_path, "export", session_id], 180
+                    )
+                    response, input_tokens, output_tokens = _parse_opencode_export(exp.stdout)
+                except subprocess.TimeoutExpired:
+                    last_error = ModelRunnerError(
+                        provider="opencode", error_type="subprocess_error",
+                        message="opencode export timed out",
+                    )
+                except (json.JSONDecodeError, ValueError) as exc:
+                    last_error = ModelRunnerError(
+                        provider="opencode", error_type="json_parse_error",
+                        message=f"Failed to parse opencode export JSON: {exc}",
+                    )
+
+                if response.strip():
+                    if attempt > 1 and logger:
+                        logger.log(f"[OpenCode] Succeeded on attempt {attempt}")
+                    break
+                if last_error is None:
+                    last_error = ModelRunnerError(
+                        provider="opencode", error_type="empty_response",
+                        message="opencode returned empty response — "
+                                + (oc_err or "model produced no text (often a transient "
+                                   "provider error such as HTTP 503)"),
+                        exit_code=result.returncode, stderr=result.stderr, stdout=result.stdout,
+                    )
+                    fatal = oc_auth
+
+        if logger:
+            logger.log(f"[OpenCode] Attempt {attempt}/{MAX_RETRIES} failed: {last_error}")
+        if fatal:
+            # Auth errors won't fix themselves — stop retrying and surface now.
+            if logger:
+                logger.log("[OpenCode] Auth error — not retrying.")
+            break
+        if attempt < MAX_RETRIES:
+            wait = RETRY_BACKOFF[attempt - 1]
+            if logger:
+                logger.log(f"[OpenCode] Retrying in {wait}s...")
+            await asyncio.sleep(wait)
+
+    total_elapsed = (datetime.now() - start).total_seconds()
+
+    if not response.strip():
+        if tracker:
+            tracker.record(call_name or "opencode", input_tokens, output_tokens,
+                           total_elapsed, provider="opencode", model=model)
+        raise last_error or ModelRunnerError(
+            provider="opencode", error_type="empty_response",
+            message="opencode returned empty response",
+        )
+
+    if logger:
+        logger.log(f"[OpenCode] Completed {call_name} in {total_elapsed:.0f}s "
+                    f"({input_tokens} in / {output_tokens} out)")
+    if tracker:
+        tracker.record(call_name or "opencode", input_tokens, output_tokens,
+                       total_elapsed, provider="opencode", model=model)
+
+    return response
+
+
+# ---------------------------------------------------------------------------
 # Per-agent override resolution
 # ---------------------------------------------------------------------------
 
@@ -624,9 +1001,10 @@ def resolve_agent_provider_config(
             f"Agent role config is missing required 'provider' field: {agent_role_cfg!r}"
         )
     provider = provider.lower().strip()
-    if provider not in ("claude", "codex", "gemini"):
+    if provider not in ("claude", "codex", "gemini", "opencode"):
         raise ValueError(
-            f"Unknown provider {provider!r}; expected 'claude', 'codex', or 'gemini'."
+            f"Unknown provider {provider!r}; expected 'claude', 'codex', "
+            f"'gemini', or 'opencode'."
         )
 
     overrides = {k: v for k, v in agent_role_cfg.items() if k != "provider"}
@@ -671,7 +1049,7 @@ async def run_model(
     """Dispatch a prompt to the specified model provider.
 
     Args:
-        provider: One of "claude", "codex", "gemini".
+        provider: One of "claude", "codex", "gemini", "opencode".
         prompt: The full prompt string.
         working_dir: Agent's working directory.
         config: Full pipeline config dict (with claude/codex/gemini sections).
@@ -700,9 +1078,14 @@ async def run_model(
             prompt, working_dir, config.get("gemini", {}),
             logger=logger, tracker=tracker, call_name=call_name,
         )
+    elif provider == "opencode":
+        return await run_opencode_agent(
+            prompt, working_dir, config.get("opencode", {}),
+            logger=logger, tracker=tracker, call_name=call_name,
+        )
     else:
         raise ValueError(f"Unknown model provider: {provider!r}. "
-                         f"Expected 'claude', 'codex', or 'gemini'.")
+                         f"Expected 'claude', 'codex', 'gemini', or 'opencode'.")
 
 
 async def run_model_for_agent(

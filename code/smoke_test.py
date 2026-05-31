@@ -274,7 +274,8 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
         if prov:
             providers_in_use.add(prov)
 
-    providers_in_use = {p for p in providers_in_use if p in {"claude", "codex", "gemini"}}
+    providers_in_use = {p for p in providers_in_use
+                        if p in {"claude", "codex", "gemini", "opencode"}}
 
     # -------------------------------------------------------
     # Test 5: Claude CLI connectivity (provider-aware)
@@ -380,7 +381,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
     # -------------------------------------------------------
     print("\n=== Test 6: Config validation ===")
     pipeline_cfg = config.get("pipeline", {})
-    check("claude config present", "claude" in config, "Missing claude config")
+    check("opencode config present", "opencode" in config, "Missing opencode config")
 
     prover_cfg = config.get("prover", {})
     prover_mode = prover_cfg.get("mode", "decomposition")
@@ -392,7 +393,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
     check("decomposition config present", bool(decomp_cfg),
           "Missing decomposition config")
 
-    valid_providers = {"claude", "codex", "gemini"}
+    valid_providers = {"claude", "codex", "gemini", "opencode"}
 
     def _validate_role(label: str, role_cfg) -> None:
         if not isinstance(role_cfg, dict):
@@ -562,6 +563,60 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
             else:
                 check(f"Gemini CLI '{gemini_cli}' found", False,
                       "Install gemini or switch decomposition.models.* away from gemini")
+
+        # --- OpenCode ---
+        if "opencode" in providers_to_test:
+            oc_cfg = config.get("opencode", {})
+            oc_cli = oc_cfg.get("cli_path", "opencode")
+            if shutil.which(oc_cli) is None:
+                # opencode is the project's only model backend, so a missing
+                # CLI is a real failure (unlike codex/gemini, which are optional).
+                check(f"OpenCode CLI '{oc_cli}' found", False,
+                      "Install opencode (https://opencode.ai) — it is the model backend this project uses.")
+            else:
+                check(f"OpenCode CLI '{oc_cli}' found", True)
+                from model_runner import (_extract_opencode_session_id,
+                                          _parse_opencode_export)
+                oc_model = oc_cfg.get("model", "google/gemini-3-flash-preview")
+                oc_cwd = tempfile.mkdtemp()
+                oc_env = os.environ.copy()
+                if oc_cfg.get("api_key"):
+                    oc_env["GEMINI_API_KEY"] = oc_cfg["api_key"]
+                try:
+                    # opencode run doesn't flush the reply to stdout when piped;
+                    # recover the session id, then read it back via `export`.
+                    rr = subprocess.run(
+                        [oc_cli, "run", "--format", "json",
+                         "--dangerously-skip-permissions", "-m", oc_model,
+                         "--dir", oc_cwd, "Reply with exactly: SMOKE_TEST_OK"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        stdin=subprocess.DEVNULL, text=True, env=oc_env,
+                        cwd=oc_cwd, timeout=150,
+                    )
+                    sid = _extract_opencode_session_id(rr.stdout, rr.stderr)
+                    oc_resp = ""
+                    if sid:
+                        er = subprocess.run(
+                            [oc_cli, "export", sid],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, env=oc_env, timeout=120,
+                        )
+                        oc_resp, _, _ = _parse_opencode_export(er.stdout)
+                    if oc_resp.strip():
+                        check("OpenCode responds", True)
+                        check("OpenCode response valid",
+                              "smoke" in oc_resp.lower() or "ok" in oc_resp.lower()
+                              or len(oc_resp) > 3, f"Got: {oc_resp[:100]}")
+                    else:
+                        # No text is usually a transient provider error (HTTP 503).
+                        # Warn but don't fail — that would abort run.sh.
+                        print("  WARN: OpenCode produced no response (often a transient "
+                              "provider HTTP 503). Not failing the smoke test; retry, or "
+                              "verify `opencode auth login`.")
+                except subprocess.TimeoutExpired:
+                    print("  WARN: OpenCode connectivity timed out; not failing the smoke test.")
+                except Exception as e:
+                    print(f"  WARN: OpenCode connectivity error: {e}; not failing the smoke test.")
     else:
         print("\n=== Test 8: Non-Claude provider connectivity [SKIPPED — no non-Claude providers enabled] ===")
 

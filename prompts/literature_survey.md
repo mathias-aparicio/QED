@@ -65,6 +65,8 @@ Extract useful tools, techniques, and insights related to this problem.
 
 Use web search extensively — ArXiv, Google Scholar, MathSciNet, Math StackExchange, MathOverflow, Wikipedia, textbook references.
 
+**Use the `websearch_cited` tool for all web research.** It performs a real, cited Google-grounded search and returns sources — prefer it over guessing URLs with `webfetch`. Use `webfetch` only to open a specific URL that `websearch_cited` already surfaced. Keep searches focused (a handful of well-chosen queries) rather than dozens of blind fetches.
+
 The depth of this step depends on your difficulty evaluation:
 - **Medium:** Moderate survey — cover key theorems and do a targeted paper search.
 - **Hard:** Full survey — exhaustive search. Leave no stone unturned. The proof agent will need every advantage.

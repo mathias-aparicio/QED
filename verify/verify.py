@@ -119,9 +119,10 @@ def merge_provider_section(config: dict, role_cfg: dict) -> tuple[str, dict]:
     auth block (subscription/api_key/bedrock) ``claude.provider`` selects.
     """
     provider = role_cfg["provider"].lower().strip()
-    if provider not in ("claude", "codex", "gemini"):
+    if provider not in ("claude", "codex", "gemini", "opencode"):
         raise ValueError(
-            f"Unknown provider {provider!r}; expected 'claude', 'codex', or 'gemini'."
+            f"Unknown provider {provider!r}; expected 'claude', 'codex', "
+            f"'gemini', or 'opencode'."
         )
     overrides = {k: v for k, v in role_cfg.items() if k != "provider"}
     global_section = config.get(provider, {})
@@ -316,6 +317,92 @@ def run_gemini(prompt: str, gemini_cfg: dict, model_override: str | None = None)
     return response
 
 
+def _opencode_session_id(stdout: str, stderr: str) -> str | None:
+    """Recover the opencode session id from a `run` invocation's output."""
+    for line in (stdout or "").strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(ev, dict):
+            sid = ev.get("sessionID")
+            if sid:
+                return sid
+            part = ev.get("part")
+            if isinstance(part, dict) and part.get("sessionID"):
+                return part["sessionID"]
+    m = re.search(r"ses_[A-Za-z0-9]+", stderr or "")
+    return m.group(0) if m else None
+
+
+def run_opencode(prompt: str, opencode_cfg: dict, model_override: str | None = None) -> str:
+    """Invoke opencode CLI and return response text.
+
+    opencode doesn't flush the assistant reply to stdout when piped (only the
+    ``step_start`` event, which carries the session id). So we run, recover the
+    session id, then read the assistant text back via ``opencode export``.
+    """
+    cli_path = opencode_cfg.get("cli_path", "opencode")
+    model = model_override or opencode_cfg.get("model", "google/gemini-3-flash-preview")
+    variant = opencode_cfg.get("variant", "")
+    agent_name = opencode_cfg.get("agent", "")
+    api_key = opencode_cfg.get("api_key", "")
+    timeout = opencode_cfg.get("timeout", 1800)
+
+    cmd = [
+        cli_path, "run", "--format", "json",
+        "--dangerously-skip-permissions", "-m", model, "--dir", os.getcwd(),
+    ]
+    if variant:
+        cmd += ["--variant", variant]
+    if agent_name:
+        cmd += ["--agent", agent_name]
+    cmd.append(prompt)
+
+    env = os.environ.copy()
+    if api_key:
+        env["GEMINI_API_KEY"] = api_key
+    # Default to the project's opencode config (web-search plugin) if unset.
+    if "OPENCODE_CONFIG" not in env:
+        repo_cfg = os.path.join(REPO_ROOT, "opencode.json")
+        if os.path.exists(repo_cfg):
+            env["OPENCODE_CONFIG"] = repo_cfg
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, env=env, timeout=timeout)
+    if result.returncode != 0 and result.stderr.strip():
+        print(f"[OpenCode] stderr: {result.stderr.strip()[:500]}", file=sys.stderr)
+
+    sid = _opencode_session_id(result.stdout, result.stderr)
+    response = ""
+    if sid:
+        er = subprocess.run([cli_path, "export", sid], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            text=True, env=env, timeout=180)
+        try:
+            data = json.loads(er.stdout)
+            last_text: list[str] = []
+            for msg in data.get("messages", []):
+                if msg.get("info", {}).get("role") != "assistant":
+                    continue
+                texts = [p.get("text", "") for p in msg.get("parts", [])
+                         if isinstance(p, dict) and p.get("type") == "text"
+                         and isinstance(p.get("text"), str)]
+                if texts:
+                    last_text = texts
+            response = "".join(last_text).strip()
+        except (json.JSONDecodeError, ValueError):
+            response = ""
+
+    if not response.strip():
+        raise RuntimeError("opencode returned empty response (model produced no text; "
+                           "often a transient provider HTTP 503).")
+    return response
+
+
 def run_model_for_role(role_cfg: dict, prompt: str, config: dict) -> str:
     """Dispatch a prompt using a per-agent role config dict.
 
@@ -333,9 +420,11 @@ def run_model_for_role(role_cfg: dict, prompt: str, config: dict) -> str:
         return run_codex(prompt, merged_section, model_override)
     elif provider == "gemini":
         return run_gemini(prompt, merged_section, model_override)
+    elif provider == "opencode":
+        return run_opencode(prompt, merged_section, model_override)
     else:
         raise ValueError(f"Unknown provider: {provider!r}. "
-                         f"Expected 'claude', 'codex', or 'gemini'.")
+                         f"Expected 'claude', 'codex', 'gemini', or 'opencode'.")
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +651,7 @@ def main():
     parser.add_argument("-o", "--output", default=None,
                         help="Write report to file (default: stdout)")
     parser.add_argument("--provider", default=None,
-                        choices=["claude", "codex", "gemini"],
+                        choices=["claude", "codex", "gemini", "opencode"],
                         help="Override all agents to one provider")
     parser.add_argument("-m", "--model", default=None,
                         help="Override model name for all agents")
